@@ -35,6 +35,74 @@ module.exports = class WireGuard {
   // Путь к файлу с данными трафика
   static TRAFFIC_PATH = path.join(WG_PATH, 'traffic.json');
 
+  // "Очередь" (mutex) для сериализации доступа к traffic.json.
+  // Node.js однопоточный, но async-код может переключаться между операциями
+  // на любом `await`, поэтому без блокировки два параллельных запроса могли
+  // одновременно прочитать traffic.json, независимо посчитать новые значения
+  // и записать их — при этом обновление, записанное первым, терялось бы
+  // (классическая гонка read-modify-write). Все операции чтения+записи
+  // traffic.json теперь по очереди проходят через __withTrafficLock().
+  __trafficLock = Promise.resolve();
+
+  // Ссылка на таймер периодического фонового обновления трафика (см. startTrafficMonitor)
+  __trafficMonitorTimer = null;
+
+  // Выполняет переданную асинхронную функцию так, чтобы в один момент времени
+  // выполнялась только одна такая операция с traffic.json — остальные ждут
+  // своей очереди. Даже если task() выбросит ошибку, блокировка корректно
+  // снимается (следующая операция из очереди не "зависнет").
+  async __withTrafficLock(task) {
+    const previous = this.__trafficLock;
+    let release;
+    this.__trafficLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+    }
+  }
+
+  // Запускает периодическое фоновое обновление трафика (по умолчанию раз в 5 минут).
+  //
+  // Раньше updateMonthlyTraffic() вызывалась ТОЛЬКО когда кто-то открывал
+  // веб-интерфейс (внутри getClients()) или при штатном завершении процесса
+  // (Shutdown(), например по SIGTERM). Если сервер перезагружался "жёстко"
+  // (сброс питания, OOM-kill, `docker kill` и т.п. — без вызова Shutdown()),
+  // а между визитами в UI прошло много времени, то весь трафик, накопленный
+  // WireGuard-интерфейсом с момента последнего пересчёта, терялся безвозвратно:
+  // счётчик интерфейса обнулялся при перезапуске раньше, чем программа успевала
+  // снять с него "снимок".
+  //
+  // Регулярный фоновый вызов сокращает окно потенциальной потери данных
+  // с "сколько угодно долго между визитами в UI" до размера интервала
+  // (по умолчанию 5 минут).
+  startTrafficMonitor(intervalMs = 5 * 60 * 1000) {
+    if (this.__trafficMonitorTimer) {
+      return; // уже запущен, повторный запуск не нужен
+    }
+    this.__trafficMonitorTimer = setInterval(() => {
+      this.updateMonthlyTraffic().catch((err) => {
+        debug(`Periodic traffic update failed: ${err.message}`);
+      });
+    }, intervalMs);
+    // unref(), чтобы этот таймер не мешал процессу штатно завершиться
+    if (typeof this.__trafficMonitorTimer.unref === 'function') {
+      this.__trafficMonitorTimer.unref();
+    }
+    debug(`Traffic monitor started (interval: ${intervalMs}ms)`);
+  }
+
+  // Останавливает фоновое обновление трафика (используется при штатном завершении)
+  stopTrafficMonitor() {
+    if (this.__trafficMonitorTimer) {
+      clearInterval(this.__trafficMonitorTimer);
+      this.__trafficMonitorTimer = null;
+    }
+  }
+
   async __buildConfig() {
     this.__configPromise = Promise.resolve().then(async () => {
       if (!WG_HOST) {
@@ -141,8 +209,13 @@ ${client.preSharedKey ? `PresharedKey = ${client.preSharedKey}\n` : ''}AllowedIP
 
   async getClients() {
     const config = await this.getConfig();
-    const trafficData = await this.getTrafficData();
+    // ВАЖНО: сначала пересчитываем и сохраняем трафик (updateMonthlyTraffic сама
+    // читает и сохраняет актуальный traffic.json), и только ПОСЛЕ этого читаем
+    // его для формирования ответа. Раньше порядок был обратный: trafficData
+    // читался до пересчёта, из-за чего пользователь в UI видел данные,
+    // актуальные на момент ПРЕДЫДУЩЕГО запроса, а не только что посчитанные.
     await this.updateMonthlyTraffic(); // Обновляем трафик перед получением данных
+    const trafficData = await this.getTrafficData();
     let configUpdated = false; // Флаг для отслеживания необходимости сохранения конфигурации
 	const currentDate = new Date();
     const clients = Object.entries(config.clients).map(([clientId, client]) => {
@@ -355,12 +428,18 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
 
   async deleteClient({ clientId }) {
     const config = await this.getConfig();
-    const trafficData = await this.getTrafficData();
 
     if (config.clients[clientId]) {
       delete config.clients[clientId];
-      delete trafficData.clients[clientId];
-      await this.saveTrafficData(trafficData);
+      // Чтение + изменение + запись traffic.json — под той же блокировкой,
+      // что и updateMonthlyTraffic(), чтобы не столкнуться с параллельным
+      // фоновым/UI-пересчётом трафика, который мог бы читать/писать файл
+      // в этот же момент времени.
+      await this.__withTrafficLock(async () => {
+        const trafficData = await this.getTrafficData();
+        delete trafficData.clients[clientId];
+        await this.saveTrafficData(trafficData);
+      });
       await this.saveConfig();
     }
   }
@@ -467,7 +546,9 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     debug('Starting configuration restore process.');
     const _config = JSON.parse(config);
     await this.__saveConfig(_config);
-    await this.saveTrafficData({ clients: {} });
+    // Тоже через блокировку — полная перезапись traffic.json не должна
+    // пересекаться по времени с фоновым/UI пересчётом трафика.
+    await this.__withTrafficLock(() => this.saveTrafficData({ clients: {} }));
     await this.__reloadConfig();
     debug('Configuration restore process completed.');
   }
@@ -498,8 +579,16 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
     //debug('Traffic data saved.');
   }
 
-  // Функция для обновления месячного трафика
+  // Функция для обновления месячного трафика.
+  // Вся операция (чтение traffic.json -> расчёт -> запись traffic.json)
+  // выполняется под блокировкой __withTrafficLock, чтобы два параллельных
+  // вызова (например, два одновременных запроса к UI) не читали и не писали
+  // файл одновременно и не затирали обновления друг друга.
   async updateMonthlyTraffic() {
+    return this.__withTrafficLock(() => this.__updateMonthlyTraffic());
+  }
+
+  async __updateMonthlyTraffic() {
     //debug('Starting updateMonthlyTraffic...');
     const config = await this.getConfig();
     //debug(`Loaded config with ${Object.keys(config.clients).length} clients`);
@@ -534,11 +623,29 @@ Endpoint = ${WG_HOST}:${WG_CONFIG_PORT}`;
       }
       //debug(`Client traffic for ${clientId}: transferRx=${clientTraffic.transferRx}, transferTx=${clientTraffic.transferTx}`);
       if (!trafficData.clients[clientId][currentMonth]) {
+        // ВАЖНО: счётчики transferRx/transferTx в `wg show ... dump` являются
+        // накопительными для сетевого интерфейса и обнуляются ТОЛЬКО при
+        // перезапуске интерфейса (например, при перезагрузке сервера), а не при
+        // смене месяца. Раньше здесь lastTransferRx/lastTransferTx всегда
+        // выставлялись в 0 при создании записи нового месяца, из-за чего в первый
+        // же вызов после смены месяца в дельту (deltaRx/deltaTx) засчитывался ВЕСЬ
+        // текущий накопленный счётчик интерфейса (то есть весь трафик со времени
+        // последней перезагрузки, а не трафик, реально прошедший в новом месяце).
+        // Это и приводило к некорректному, завышенному месячному трафику.
+        //
+        // Исправление: при старте нового месяца в качестве базовой точки
+        // (lastTransferRx/lastTransferTx) берём ТЕКУЩЕЕ значение счётчика
+        // интерфейса на этот момент, а не 0. Тогда в первом же расчёте дельты
+        // ниже получится 0 (мы просто фиксируем точку отсчёта), а весь трафик,
+        // накопленный до начала месяца, корректно останется отнесён к
+        // предыдущему месяцу (он уже был учтён туда ранее). Дальнейший рост
+        // счётчика будет попадать в totalTransferRx/Tx уже правильно, вне
+        // зависимости от того, перезагружался сервер или нет.
         trafficData.clients[clientId][currentMonth] = {
-          totalTransferRx: 0, // Общее накопленное значение входящего трафика
-          totalTransferTx: 0, // Общее накопленное значение исходящего трафика
-          lastTransferRx: 0,  // Последнее значение входящего трафика из wg
-          lastTransferTx: 0,  // Последнее значение исходящего трафика из wg
+          totalTransferRx: 0, // Общее накопленное значение входящего трафика за месяц
+          totalTransferTx: 0, // Общее накопленное значение исходящего трафика за месяц
+          lastTransferRx: clientTraffic.transferRx, // Базовое (стартовое) значение счётчика wg на начало месяца
+          lastTransferTx: clientTraffic.transferTx, // Базовое (стартовое) значение счётчика wg на начало месяца
           lastUpdated: new Date().toISOString(),
         };
         //debug(`Initialized traffic for ${clientId} in ${currentMonth}`);
