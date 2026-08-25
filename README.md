@@ -122,6 +122,14 @@ WireGuard and AmneziaWG Easy рекомендуется запускать с п
 Чтобы обновиться до последней версии, просто запустите:
 
 ```bash
+cd /папка/с/docker-compose.yml
+docker compose pull
+docker compose up -d
+```
+
+или
+
+```bash
 docker stop wgandamneziawg-easy
 docker rm wgandamneziawg-easy
 docker pull ghcr.io/nonenulldev404/wgandamneziawg-easy:latest
